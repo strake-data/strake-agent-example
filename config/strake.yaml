@@ -1,0 +1,5 @@
+sources_path: "config/sources.yaml"
+server:
+  host: "0.0.0.0"
+  port: 8001
+  transport: "sse"

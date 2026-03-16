@@ -1,0 +1,11 @@
+[project]
+name = "strake-agent-example"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "chainlit>=2.10.0",
+    "pydantic-ai[google]>=0.1",
+    "strake>=0.2.3",
+]

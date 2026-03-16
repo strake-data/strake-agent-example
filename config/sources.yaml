@@ -1,0 +1,32 @@
+sources:
+  - name: public
+    type: sql
+    dialect: sqlite
+    connection: "data/alerts.db"
+    tables:
+      - name: alerts
+
+  - name: metrics
+    type: parquet
+    path: "data/metrics.parquet"
+    tables:
+      - name: metrics
+
+  - name: deployments
+    type: json
+    path: "data/deployments.ndjson"
+    tables:
+      - name: deployments
+
+  - name: oncall
+    type: csv
+    path: "data/oncall.csv"
+    has_header: true
+    tables:
+      - name: oncall
+
+  - name: deployment_users
+    type: rest
+    url: "http://localhost:8500/git-deploys"
+    tables:
+      - name: git_deploys
