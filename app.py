@@ -4,6 +4,7 @@ Uses PydanticAI + Gemini + Strake MCP to investigate production incidents.
 """
 
 import asyncio
+import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -14,6 +15,7 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ToolReturnPart,
+    UserPromptPart,
 )
 from pydantic_ai.usage import RunUsage
 
@@ -25,9 +27,14 @@ from strake_agent.compact import (
 from strake_agent.config import (
     AUTO_COMPACT_THRESHOLD,
     STRAKE_SSE_URL,
+    TASK_REMINDER_ROUNDS,
     get_model_settings,
     logger,
 )
+from strake_agent.task_manager import TaskManager
+from strake_agent.background_manager import BackgroundManager
+from pathlib import Path
+import json
 
 
 @dataclass(frozen=True)
@@ -66,9 +73,11 @@ async def _mcp_worker() -> None:
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     mcp_tools = await session.list_tools()
-                    _GLOBAL_MCP["session"] = session
-                    _GLOBAL_MCP["tools"] = mcp_tools.tools
-                    _GLOBAL_MCP["ready"].set()
+                    async with _MCP_LOCK:
+                        _GLOBAL_MCP["session"] = session
+                        _GLOBAL_MCP["tools"] = mcp_tools.tools
+                        _GLOBAL_MCP["error"] = None
+                        _GLOBAL_MCP["ready"].set()
                     logger.info(
                         "MCP worker ready - %d tools available.", len(mcp_tools.tools)
                     )
@@ -77,10 +86,26 @@ async def _mcp_worker() -> None:
                         # Keep-alive or periodic refresh if needed
                         await asyncio.sleep(30)
         except Exception as e:
-            _GLOBAL_MCP["ready"].clear()
-            _GLOBAL_MCP["error"] = str(e)
+            async with _MCP_LOCK:
+                _GLOBAL_MCP["session"] = None
+                _GLOBAL_MCP["tools"] = []
+                _GLOBAL_MCP["ready"].clear()
+                _GLOBAL_MCP["error"] = str(e)
             logger.error("MCP worker encountered an error: %s. Retrying in 5s...", e)
             await asyncio.sleep(5)
+
+
+async def _current_mcp() -> tuple[Any, list[Any]]:
+    async with _MCP_LOCK:
+        return _GLOBAL_MCP["session"], list(_GLOBAL_MCP["tools"])
+
+
+def _session_tasks_dir() -> Path:
+    session_id = cl.user_session.get("task_session_id")
+    if not session_id:
+        session_id = uuid.uuid4().hex
+        cl.user_session.set("task_session_id", session_id)
+    return Path(".tasks") / session_id
 
 
 async def set_investigating(active: bool, step: StepInfo | None = None) -> None:
@@ -134,17 +159,17 @@ async def set_investigating(active: bool, step: StepInfo | None = None) -> None:
             cl.user_session.set("investigating_msg", None)
 
 
-async def todo_confirmation_callback(rendered_todo: str) -> bool:
+async def plan_confirmation_callback(rendered_plan: str) -> bool:
     """Request user confirmation for an investigation plan via Chainlit actions.
 
     Args:
-        rendered_todo: The markdown-formatted todo list.
+        rendered_plan: The markdown-formatted plan or task list.
 
     Returns:
         True if the user confirmed the plan, False otherwise.
     """
     logger.debug("Prompting user for plan confirmation.")
-    plan_markdown = f"### Investigation Strategy\n\n{rendered_todo}\n\n**Do you want to proceed with this plan?**"
+    plan_markdown = f"### Investigation Strategy\n\n{rendered_plan}\n\n**Do you want to proceed with this plan?**"
 
     res = await cl.AskActionMessage(
         content=plan_markdown,
@@ -168,6 +193,30 @@ async def todo_confirmation_callback(rendered_todo: str) -> bool:
     return confirmed
 
 
+async def action_approval_callback(title: str, detail: str) -> bool:
+    """Request user approval for a potentially destructive script."""
+    res = await cl.AskActionMessage(
+        content=f"### {title}\n\nThis script contains commands that could modify or delete data. Do you want to allow it?\n\n```python\n{detail}\n```",
+        actions=[
+            cl.Action(
+                name="allow",
+                value="allow",
+                label="✅ Allow",
+                theme="primary",
+                payload={},
+            ),
+            cl.Action(name="deny", value="deny", label="🛑 Deny", payload={}),
+        ],
+        author="System",
+    ).send()
+
+    approved = bool(res and res.get("name") == "allow")
+    logger.info(
+        "User action approval response: %s", "ALLOWED" if approved else "DENIED"
+    )
+    return approved
+
+
 # ── Chainlit lifecycle ────────────────────────────────────────────────────────
 @cl.on_chat_start
 async def on_chat_start() -> None:
@@ -182,17 +231,24 @@ async def on_chat_start() -> None:
     if not _GLOBAL_MCP["ready"].is_set():
         logger.info("Waiting for MCP worker to become ready...")
 
+    mcp_session, mcp_tools = await _current_mcp()
     cl.user_session.set("history", [])
     cl.user_session.set(
         "deps",
         Deps(
-            mcp_session=_GLOBAL_MCP["session"],
-            mcp_tools=_GLOBAL_MCP["tools"],
-            todo_confirmation_callback=todo_confirmation_callback,
-            set_investigating_callback=lambda active: set_investigating(active),
+            mcp_session=mcp_session,
+            mcp_lock=_MCP_LOCK,
+            mcp_tools=mcp_tools,
+            todo_confirmation_callback=plan_confirmation_callback,
+            set_investigating_callback=lambda active, step=None: set_investigating(
+                active, StepInfo(**step) if step else None
+            ),
             add_step_callback=lambda step: set_investigating(
                 True, step=StepInfo(**step)
             ),
+            action_approval_callback=action_approval_callback,
+            tasks=TaskManager(_session_tasks_dir()),
+            background=BackgroundManager(workdir=Path.cwd()),
         ),
     )
 
@@ -211,25 +267,41 @@ Try asking: *"What caused the API latency spike at 14:30 UTC?"*""",
     ).send()
 
 
-async def _check_and_compact(history: list[ModelMessage]) -> list[ModelMessage]:
-    """Check if the context exceeds the threshold and trigger auto-compaction if so.
+async def _trigger_background_compaction(history: list[ModelMessage]) -> None:
+    """Check if the context exceeds the threshold and trigger background compaction asynchronously.
 
-    Args:
-        history: Current conversation history.
-
-    Returns:
-        The (possibly compacted) history.
+    This runs out-of-band, updating the session history in the background without holding up the user.
     """
-    token_count = estimate_tokens(history)
-    if token_count > AUTO_COMPACT_THRESHOLD:
-        status_msg = await cl.Message(
-            content=f"⚡ Context at ~{token_count:,} tokens — auto-compressing...",
-            author="System",
-        ).send()
-        new_history = await auto_compact(history)
-        status_msg.content = "✅ Compressed. Transcript saved."
-        await status_msg.update()
-        return new_history
+    try:
+        token_count = estimate_tokens(history)
+        if token_count > AUTO_COMPACT_THRESHOLD:
+            logger.info(
+                "⚡ Context at ~%d tokens — starting background compaction...",
+                token_count,
+            )
+            new_history = await auto_compact(history)
+            cl.user_session.set("history", new_history)
+            logger.info("✅ Background context compaction complete.")
+    except Exception as bg_err:
+        logger.error("Background compaction failed: %s", bg_err)
+
+
+async def _maybe_inject_nag(
+    deps: Deps, history: list[ModelMessage]
+) -> list[ModelMessage]:
+    """Inject a task reminder into the history if tasks have been pending for too long."""
+    if deps.rounds_since_todo >= TASK_REMINDER_ROUNDS and deps.tasks:
+        ready_json = deps.tasks.list_ready()
+        ready = json.loads(ready_json)
+        if ready:
+            nag = ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content=f"<reminder>You have {len(ready)} pending tasks ready to start — update your progress or continue with the next task.</reminder>"
+                    )
+                ]
+            )
+            return history + [nag]
     return history
 
 
@@ -257,22 +329,43 @@ async def on_message(message: cl.Message) -> None:
     deps: Deps = cl.user_session.get("deps")
 
     # Refresh MCP session in case worker reconnected
-    deps.mcp_session = _GLOBAL_MCP["session"]
+    deps.mcp_session, deps.mcp_tools = await _current_mcp()
 
     # Context management (Pre-run)
-    history = await _check_and_compact(history)
+    history = await _maybe_inject_nag(deps, history)
+
+    # ⚡ s08: Drain background notifications
+    if deps.background:
+        notifs = deps.background.drain_notifications()
+        if notifs:
+            notif_text = "\n".join(
+                f"[bg:{n['task_id']}] Command `{n['command']}` finished.\nResult: {n['result']}"
+                for n in notifs
+            )
+            history.append(
+                ModelRequest(
+                    parts=[
+                        UserPromptPart(
+                            content=f"<background-results>\n{notif_text}\n</background-results>"
+                        )
+                    ]
+                )
+            )
 
     await set_investigating(True)
 
     complete_text = ""
-    new_history = []
+    new_history = history
     turn_usage = RunUsage()
     try:
+        from pydantic_ai.usage import UsageLimits
+
         async with agent.run_stream(
             message.content,
             message_history=history,
             deps=deps,
             model_settings=get_model_settings(),
+            usage_limits=UsageLimits(total_tokens_limit=150000),
         ) as result:
             async for chunk in result.stream_text(delta=True):
                 complete_text += chunk
@@ -280,6 +373,9 @@ async def on_message(message: cl.Message) -> None:
             # Capture version inside the context manager
             new_history = result.all_messages()
             turn_usage = result.usage()
+    except Exception:
+        logger.error("run_stream failed", exc_info=True)
+        raise
     finally:
         await set_investigating(False)
 
@@ -316,7 +412,10 @@ async def on_message(message: cl.Message) -> None:
         await comp_msg.update()
 
     deps.cumulative_usage += turn_usage
-    new_history = await _check_and_compact(new_history)
+    deps.script_calls_this_turn = 0
+
+    # Trigger background compaction out-of-band (out of user request thread)
+    asyncio.create_task(_trigger_background_compaction(new_history))
 
     cl.user_session.set("history", new_history)
     cl.user_session.set("deps", deps)
@@ -324,6 +423,6 @@ async def on_message(message: cl.Message) -> None:
     final_tokens = estimate_tokens(new_history)
     await cl.Message(
         content=f"_~{turn_usage.total_tokens:,} tokens this turn · "
-        f"{estimate_tokens(new_history):,} tokens in context_",
+        f"{final_tokens:,} tokens in context_",
         author="System",
     ).send()

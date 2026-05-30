@@ -38,7 +38,7 @@ def get_git_deploys():
     engineers = get_engineers()
     if os.path.exists(DEPLOYMENTS_PATH):
         with open(DEPLOYMENTS_PATH, "r") as f:
-            deployments = json.load(f)
+            deployments = [json.loads(line) for line in f if line.strip()]
 
             results = []
             for d in deployments[:100]:

@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "chainlit>=2.10.0",
+    "pandas>=3.0.1",
     "pydantic-ai[google]>=0.1",
-    "strake>=0.2.3",
+    "strake>=0.2.5",
 ]

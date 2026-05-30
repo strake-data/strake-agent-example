@@ -98,6 +98,7 @@ class SkillLoader:
             available = ", ".join(self.skills.keys()) or "none"
             logger.warning("Requested unknown skill: %s", name)
             return f"Unknown skill '{name}'. Available: {available}"
+        logger.info("Skill loaded: %s", name)
         return f'<skill name="{name}">\n{skill.body}\n</skill>'
 
 
